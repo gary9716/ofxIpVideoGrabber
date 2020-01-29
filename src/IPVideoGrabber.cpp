@@ -415,305 +415,319 @@ std::string IPVideoGrabber::getDefaultBoundaryMarker() const
 
 void IPVideoGrabber::threadedFunction()
 {
-    Poco::Buffer<char> cBuf(BUF_LEN);
+	while (true) {
 
-    ofBuffer buffer;
+		Poco::Buffer<char> cBuf(BUF_LEN);
 
-    Poco::Net::HTTPClientSession session;
-    
-    ///////////////////////////
-	mutex.lock(); // LOCKING //
-    ///////////////////////////
-        
-    connectTime_a = ofGetSystemTimeMillis(); // start time
-    nextAutoRetry_a = 0;
-    
-    elapsedTime_a = 0;
-    nBytes_a      = 0;
-    nFrames_a     = 0;
-    
-    needsReconnect_a = false;
-    reconnectCount_a++;
+		ofBuffer buffer;
 
-    ///////////////////////
-    // configure session //
-    ///////////////////////
-    
-    // configure proxy
+		Poco::Net::HTTPClientSession session;
 
-    if (bUseProxy_a)
-    {
-        if (!proxyHost_a.empty())
-        {
-            session.setProxy(proxyHost_a);
-            session.setProxyPort(proxyPort_a);
-            if (!proxyUsername_a.empty()) session.setProxyUsername(proxyUsername_a);
-            if (!proxyPassword_a.empty()) session.setProxyPassword(proxyPassword_a);
-        }
-        else
-        {
-            ofLogError("IPVideoGrabber") << "Attempted to use web proxy, but proxy host was empty.  Continuing without proxy.";
-        }
-    }
-        
-    // configure destination
-    session.setHost(uri_a.getHost());
-    session.setPort(uri_a.getPort());
-    
-    // basic session info
-    session.setKeepAlive(true);
-    session.setTimeout(Poco::Timespan(sessionTimeout * Poco::Timespan::MILLISECONDS));
-    
-    // add trailing slash if nothing is there
-    std::string path(uri_a.getPathAndQuery());
-    
-    if (path.empty()) path = "/";
+		///////////////////////////
+		mutex.lock(); // LOCKING //
+		///////////////////////////
 
-    // create our header request
-    // TODO: add SSL via ofxSSL
-    Poco::Net::HTTPRequest request(Poco::Net::HTTPRequest::HTTP_GET, path, Poco::Net::HTTPMessage::HTTP_1_1); // 1.1 for persistent connections
+		connectTime_a = ofGetSystemTimeMillis(); // start time
+		nextAutoRetry_a = 0;
 
-    // do basic access authentication if needed
-    if (!username_a.empty() || !password_a.empty())
-    {
-        Poco::Net::HTTPBasicCredentials credentials;
-        credentials.setUsername(username_a);
-        credentials.setPassword(password_a);
-        credentials.authenticate(request);
-    }
-    
-    // send cookies if needed (sometimes, we send our authentication as cookies)
-    if (!cookies.empty()) request.setCookies(cookies);
+		elapsedTime_a = 0;
+		nBytes_a = 0;
+		nFrames_a = 0;
 
-    ///////////////////////////////
-	mutex.unlock(); // UNLOCKING //
-    ///////////////////////////////
-    
-    /////////////////////////
-    // start communicating //
-    /////////////////////////
+		needsReconnect_a = false;
+		reconnectCount_a++;
 
-    Poco::Net::HTTPResponse response; // the empty data structure to fill with the response headers
+		///////////////////////
+		// configure session //
+		///////////////////////
 
-    try
-    {
+		// configure proxy
 
-        // sendn the http request.
-        std::ostream& requestOutputStream = session.sendRequest(request);
-        
-        // check the return stream for success.
-        if (requestOutputStream.bad() || requestOutputStream.fail())
-        {
-            throw Poco::Exception("Error communicating with server during sendRequest.");
-        }
-        
-        // prepare to receive the response
-        std::istream& responseInputStream = session.receiveResponse(response); // invalidates requestOutputStream
-        
-        // get and test the status code
-        Poco::Net::HTTPResponse::HTTPStatus status = response.getStatus();
-        
-        if (status != Poco::Net::HTTPResponse::HTTP_OK)
-        {
-            throw Poco::Exception("Invalid HTTP Reponse : " + response.getReasonForStatus(status), status);
-        }
-        
-        Poco::Net::NameValueCollection nvc;
-        std::string contentType;
-        std::string boundaryMarker;
-        Poco::Net::HTTPResponse::splitParameters(response.getContentType(), contentType, nvc);
-    
-        boundaryMarker = nvc.get("boundary",getDefaultBoundaryMarker()); // we call the getter here b/c not in critical section
-        
-        if (Poco::UTF8::icompare(std::string("--"), boundaryMarker.substr(0,2)) != 0)
-        {
-            boundaryMarker = "--" + boundaryMarker; // prepend the marker
-        }
-        
-        ContentStreamMode mode = MODE_HEADER;
-        
-        std::size_t c = 0;
-        
-        bool resetBuffer = false;
-        
-        // mjpeg params
-        // int contentLength = 0;
-        std::string boundaryType;
-        
-        while (_isConnected)
-        {
-            if (!responseInputStream.fail() && !responseInputStream.bad())
-            {
-                
-                resetBuffer = false;
-                responseInputStream.get(cBuf[c]); // put a byte in the buffer
-                
-                mutex.lock();
-                nBytes_a++; // count bytes
-                mutex.unlock();
-                
-                if (c > 0)
-                {
-                    if (mode == MODE_HEADER && cBuf[c-1] == '\r' && cBuf[c] == '\n')
-                    {
-                        if (c > 1)
-                        {
-                            cBuf[c-1] = '\0'; // NULL terminator
-                            std::string line(cBuf.begin()); // make a string object
-                            
-                            std::vector<std::string> keyValue = ofSplitString(line,":", true); // split it (try)
-                            if (keyValue.size() > 1)
-                            { // a param!
-                                
-                                std::string& key   = keyValue[0]; // reference to trimmed key for better readability
-                                std::string& value = keyValue[1]; // reference to trimmed val for better readability
-                                
-                                if (Poco::UTF8::icompare(std::string("content-length"), key) == 0)
-                                {
-                                    // contentLength = ofToInt(value);
-                                    // TODO: we don't currently use content length, but could
-                                }
-                                else if (Poco::UTF8::icompare(std::string("content-type"), key) == 0)
-                                {
-                                    boundaryType = value;
-                                }
-                                else
-                                {
-                                    ofLogVerbose("IPVideoGrabber") << "additional header " << key << "=" << value << " found.";
-                                }
-                            }
-                            else
-                            {
-                                if (Poco::UTF8::icompare(boundaryMarker,line) == 0)
-                                {
-                                    mode = MODE_HEADER;
-                                }
-                                else
-                                {
-                                    // just a new line
-                                }
-                                // this is where line == "--myboundary"
-                            }
-                        }
-                        else
-                        {
-                            // just waiting for at least two bytes
-                        }
-                        
-                        resetBuffer = true; // reset upon new line
-                        
-                    }
-                    else if (cBuf[c-1] == JFF)
-                    {
-                        if (cBuf[c] == SOI)
-                        {
-                            mode = MODE_JPEG;
-                        }
-                        else if (cBuf[c] == EOI)
-                        {
-                            buffer = ofBuffer(cBuf.begin(), c + 1);
+		if (bUseProxy_a)
+		{
+			if (!proxyHost_a.empty())
+			{
+				session.setProxy(proxyHost_a);
+				session.setProxyPort(proxyPort_a);
+				if (!proxyUsername_a.empty()) session.setProxyUsername(proxyUsername_a);
+				if (!proxyPassword_a.empty()) session.setProxyPassword(proxyPassword_a);
+			}
+			else
+			{
+				ofLogError("IPVideoGrabber") << "Attempted to use web proxy, but proxy host was empty.  Continuing without proxy.";
+			}
+		}
 
-                            if (c >= MIN_JPEG_SIZE)
-                            { // some cameras send 2+ EOIs in a row, with no valid bytes in between
-    
-                                ///////////////////////////////
-                                mutex.lock();     // LOCKING //
-                                ///////////////////////////////
+		// configure destination
+		session.setHost(uri_a.getHost());
+		session.setPort(uri_a.getPort());
 
-								ofPixels pix;
+		// basic session info
+		session.setKeepAlive(true);
+		session.setTimeout(Poco::Timespan(sessionTimeout * Poco::Timespan::MILLISECONDS));
 
-								bool result = ofLoadImage(pix, buffer);
+		// add trailing slash if nothing is there
+		std::string path(uri_a.getPathAndQuery());
 
-                                // get the back image (ci^1)
-                                if (result)
-                                {
-									image_a[ci^1] = pix;
-                                    isBackBufferReady_a = true;
-                                    nFrames_a++; // incrase frame cout
-                                }
-                                else
-                                {
-                                    ofLogError("IPVideoGrabber") << "ofImage could not load the curent buffer, continuing.";
-                                }
-                                
-                                ///////////////////////////////
-                                mutex.unlock(); // UNLOCKING //
-                                ///////////////////////////////
-                                    
-                            }
-                            else
-                            {
-                                //
-                            }
-                            mode = MODE_HEADER;
-                            resetBuffer = true;
-                        }
-                        else
-                        {
-                        }
-                    }
-                    else if (mode == MODE_JPEG)
-                    {
-                    }
-                    else
-                    {
-                    }
-                }
-                else
-                {
-                }
-                
-                // check for buffer overflow
-                if (c >= BUF_LEN)
-                {
-                    resetBuffer = true;
-                    ofLogError("IPVideoGrabber") << "[" + getCameraName() +"]: buffer overflow, resetting stream.";
-                }
-                
-                // has anyone requested a buffer reset?
-                if (resetBuffer)
-                {
-                    c = 0;
-                }
-                else
-                {
-                    c++;
-                }
-                
-            }
-            else
-            { // end stream check
-                throw Poco::Exception("ResponseInputStream failed or went bad -- it was probably interrupted.");
-            }
-            
-        } // end while
+		if (path.empty()) path = "/";
 
-    }
-    catch (const Poco::Exception& e)
-    {
-        mutex.lock();
-        needsReconnect_a = true;
-//        _isConnected = false;
-        nextAutoRetry_a = ofGetSystemTimeMillis() + autoRetryDelay_a;
-        mutex.unlock();
-        ofLogError("IPVideoGrabber") << "Exception : [" << getCameraName() << "]: " <<  e.displayText();
-    }
-    catch (...)
-    {
-        mutex.lock();
-        needsReconnect_a = true;
-//        _isConnected = false;
-        nextAutoRetry_a = ofGetSystemTimeMillis() + autoRetryDelay_a;
-        mutex.unlock();
-        ofLogError("IPVideoGrabber") << "Unknown exception.";
-    }
+		// create our header request
+		// TODO: add SSL via ofxSSL
+		Poco::Net::HTTPRequest request(Poco::Net::HTTPRequest::HTTP_GET, path, Poco::Net::HTTPMessage::HTTP_1_1); // 1.1 for persistent connections
+
+		// do basic access authentication if needed
+		if (!username_a.empty() || !password_a.empty())
+		{
+			Poco::Net::HTTPBasicCredentials credentials;
+			credentials.setUsername(username_a);
+			credentials.setPassword(password_a);
+			credentials.authenticate(request);
+		}
+
+		// send cookies if needed (sometimes, we send our authentication as cookies)
+		if (!cookies.empty()) request.setCookies(cookies);
+
+		///////////////////////////////
+		mutex.unlock(); // UNLOCKING //
+		///////////////////////////////
+
+		/////////////////////////
+		// start communicating //
+		/////////////////////////
+
+		Poco::Net::HTTPResponse response; // the empty data structure to fill with the response headers
+
+		try
+		{
+
+			// sendn the http request.
+			std::ostream& requestOutputStream = session.sendRequest(request);
+
+			// check the return stream for success.
+			if (requestOutputStream.bad() || requestOutputStream.fail())
+			{
+				throw Poco::Exception("Error communicating with server during sendRequest.");
+			}
+
+			// prepare to receive the response
+			std::istream& responseInputStream = session.receiveResponse(response); // invalidates requestOutputStream
+
+			// get and test the status code
+			Poco::Net::HTTPResponse::HTTPStatus status = response.getStatus();
+
+			if (status != Poco::Net::HTTPResponse::HTTP_OK)
+			{
+				throw Poco::Exception("Invalid HTTP Reponse : " + response.getReasonForStatus(status), status);
+			}
+
+			Poco::Net::NameValueCollection nvc;
+			std::string contentType;
+			std::string boundaryMarker;
+			Poco::Net::HTTPResponse::splitParameters(response.getContentType(), contentType, nvc);
+
+			boundaryMarker = nvc.get("boundary", getDefaultBoundaryMarker()); // we call the getter here b/c not in critical section
+
+			if (Poco::UTF8::icompare(std::string("--"), boundaryMarker.substr(0, 2)) != 0)
+			{
+				boundaryMarker = "--" + boundaryMarker; // prepend the marker
+			}
+
+			ContentStreamMode mode = MODE_HEADER;
+
+			std::size_t c = 0;
+
+			bool resetBuffer = false;
+
+			// mjpeg params
+			// int contentLength = 0;
+			std::string boundaryType;
+
+			while (_isConnected)
+			{
+				if (!responseInputStream.fail() && !responseInputStream.bad())
+				{
+
+					resetBuffer = false;
+					responseInputStream.get(cBuf[c]); // put a byte in the buffer
+
+					mutex.lock();
+					nBytes_a++; // count bytes
+					mutex.unlock();
+
+					if (c > 0)
+					{
+						if (mode == MODE_HEADER && cBuf[c - 1] == '\r' && cBuf[c] == '\n')
+						{
+							if (c > 1)
+							{
+								cBuf[c - 1] = '\0'; // NULL terminator
+								std::string line(cBuf.begin()); // make a string object
+
+								std::vector<std::string> keyValue = ofSplitString(line, ":", true); // split it (try)
+								if (keyValue.size() > 1)
+								{ // a param!
+
+									std::string& key = keyValue[0]; // reference to trimmed key for better readability
+									std::string& value = keyValue[1]; // reference to trimmed val for better readability
+
+									if (Poco::UTF8::icompare(std::string("content-length"), key) == 0)
+									{
+										// contentLength = ofToInt(value);
+										// TODO: we don't currently use content length, but could
+									}
+									else if (Poco::UTF8::icompare(std::string("content-type"), key) == 0)
+									{
+										boundaryType = value;
+									}
+									else
+									{
+										ofLogVerbose("IPVideoGrabber") << "additional header " << key << "=" << value << " found.";
+									}
+								}
+								else
+								{
+									if (Poco::UTF8::icompare(boundaryMarker, line) == 0)
+									{
+										mode = MODE_HEADER;
+									}
+									else
+									{
+										// just a new line
+									}
+									// this is where line == "--myboundary"
+								}
+							}
+							else
+							{
+								// just waiting for at least two bytes
+							}
+
+							resetBuffer = true; // reset upon new line
+
+						}
+						else if (cBuf[c - 1] == JFF)
+						{
+							if (cBuf[c] == SOI)
+							{
+								mode = MODE_JPEG;
+							}
+							else if (cBuf[c] == EOI)
+							{
+								buffer = ofBuffer(cBuf.begin(), c + 1);
+
+								if (c >= MIN_JPEG_SIZE)
+								{ // some cameras send 2+ EOIs in a row, with no valid bytes in between
+
+									///////////////////////////////
+									mutex.lock();     // LOCKING //
+									///////////////////////////////
+
+									ofPixels pix;
+
+									bool result = ofLoadImage(pix, buffer);
+
+									// get the back image (ci^1)
+									if (result)
+									{
+										image_a[ci ^ 1] = pix;
+										isBackBufferReady_a = true;
+										nFrames_a++; // incrase frame cout
+									}
+									else
+									{
+										ofLogError("IPVideoGrabber") << "ofImage could not load the curent buffer, continuing.";
+									}
+
+									///////////////////////////////
+									mutex.unlock(); // UNLOCKING //
+									///////////////////////////////
+
+								}
+								else
+								{
+									//
+								}
+								mode = MODE_HEADER;
+								resetBuffer = true;
+							}
+							else
+							{
+							}
+						}
+						else if (mode == MODE_JPEG)
+						{
+						}
+						else
+						{
+						}
+					}
+					else
+					{
+					}
+
+					// check for buffer overflow
+					if (c >= BUF_LEN)
+					{
+						resetBuffer = true;
+						ofLogError("IPVideoGrabber") << "[" + getCameraName() + "]: buffer overflow, resetting stream.";
+					}
+
+					// has anyone requested a buffer reset?
+					if (resetBuffer)
+					{
+						c = 0;
+					}
+					else
+					{
+						c++;
+					}
+
+				}
+				else
+				{ // end stream check
+					throw Poco::Exception("ResponseInputStream failed or went bad -- it was probably interrupted.");
+				}
+
+			} // end while
+
+		}
+		catch (const Poco::Exception& e)
+		{
+			mutex.lock();
+			needsReconnect_a = autoReconnect;
+			//        _isConnected = false;
+			nextAutoRetry_a = ofGetSystemTimeMillis() + autoRetryDelay_a;
+			mutex.unlock();
+			ofLogError("IPVideoGrabber::") << "Exception : [" << getCameraName() << "]: " << e.displayText();
+		}
+		catch (...)
+		{
+			mutex.lock();
+			needsReconnect_a = autoReconnect;
+			//        _isConnected = false;
+			nextAutoRetry_a = ofGetSystemTimeMillis() + autoRetryDelay_a;
+			mutex.unlock();
+			ofLogError("IPVideoGrabber::") << "Unknown exception.";
+		}
 
 
-    // clean up the session
-    session.reset();
+		// clean up the session
+		session.reset();
 
-    // std::cout << "-----------------------------fell off end of loop ... needs reconnect ? " << needsReconnect_a << " is connected? " << _isConnected << std::endl;
-    // fall off the end of the loop ...
+		// std::cout << "-----------------------------fell off end of loop ... needs reconnect ? " << needsReconnect_a << " is connected? " << _isConnected << std::endl;
+		// fall off the end of the loop ...
+		
+		mutex.lock();
+		if (!needsReconnect_a) {
+			mutex.unlock();
+			break;
+		}
+		else {
+			mutex.unlock();
+			_sleep(3000);
+		}
+
+	}
 }
 
 
